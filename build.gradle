@@ -58,6 +58,23 @@ tasks.register('runHelloMmap', JavaExec) {
     jvmArgs = ['--add-opens', 'java.base/sun.nio.ch=ALL-UNNAMED']
 }
 
+// Separate process demo — run in two terminals
+tasks.register('runWriter', JavaExec) {
+    group = 'application'
+    description = 'Start the standalone Writer process (2-process demo)'
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'com.tennisleng.ipc.demo.SeparateProcessWriter'
+    jvmArgs = ['--add-opens', 'java.base/sun.nio.ch=ALL-UNNAMED']
+}
+
+tasks.register('runReader', JavaExec) {
+    group = 'application'
+    description = 'Start the standalone Reader process (2-process demo)'
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'com.tennisleng.ipc.demo.SeparateProcessReader'
+    jvmArgs = ['--add-opens', 'java.base/sun.nio.ch=ALL-UNNAMED']
+}
+
 application {
     mainClass = 'com.tennisleng.ipc.Producer'
 }
