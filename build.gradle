@@ -1,0 +1,71 @@
+plugins {
+    id 'java'
+    id 'application'
+    id 'me.champeau.jmh' version '0.7.2'
+}
+
+group = 'com.tennisleng.ipc'
+version = '1.0-SNAPSHOT'
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    // JMH for benchmarking
+    jmh 'org.openjdk.jmh:jmh-core:1.37'
+    jmh 'org.openjdk.jmh:jmh-generator-annprocess:1.37'
+
+    // Testing
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.10.2'
+}
+
+tasks.named('test') {
+    useJUnitPlatform()
+}
+
+// ── Run configurations ──────────────────────────────────────────────
+// Producer process
+tasks.register('runProducer', JavaExec) {
+    group = 'application'
+    description = 'Start the Producer process'
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'com.tennisleng.ipc.Producer'
+    jvmArgs = ['--add-opens', 'java.base/sun.nio.ch=ALL-UNNAMED']
+}
+
+// Consumer process
+tasks.register('runConsumer', JavaExec) {
+    group = 'application'
+    description = 'Start the Consumer process'
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'com.tennisleng.ipc.Consumer'
+    jvmArgs = ['--add-opens', 'java.base/sun.nio.ch=ALL-UNNAMED']
+}
+
+// Hello World demo (Week 2)
+tasks.register('runHelloMmap', JavaExec) {
+    group = 'application'
+    description = 'Run the memory-mapped Hello World demo'
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'com.tennisleng.ipc.demo.HelloMmap'
+    jvmArgs = ['--add-opens', 'java.base/sun.nio.ch=ALL-UNNAMED']
+}
+
+application {
+    mainClass = 'com.tennisleng.ipc.Producer'
+}
+
+// JMH benchmark configuration
+jmh {
+    warmupIterations = 3
+    iterations = 5
+    fork = 1
+    jvmArgs = ['--add-opens', 'java.base/sun.nio.ch=ALL-UNNAMED']
+}
