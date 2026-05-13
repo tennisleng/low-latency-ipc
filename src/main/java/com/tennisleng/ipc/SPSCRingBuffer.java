@@ -40,7 +40,6 @@ public class SPSCRingBuffer implements AutoCloseable {
 
     // ── Cache Line Constants ────────────────────────────────────────────
     private static final int CACHE_LINE_SIZE = 64;  // bytes — standard x86/ARM
-    private static final int SEQUENCE_SIZE   = Long.BYTES; // 8 bytes
 
     // ── Header Layout ───────────────────────────────────────────────────
     /**
@@ -62,14 +61,13 @@ public class SPSCRingBuffer implements AutoCloseable {
     static final int DATA_OFFSET = CACHE_LINE_SIZE * 2; // 128
 
     // ── Message Slot Layout ─────────────────────────────────────────────
-    /**
-     * Each message slot has:
-     *  - 8 bytes for payload length
-     *  - N bytes of payload data
-     *  - 1 byte commit flag
-     */
-    private static final int LENGTH_FIELD_SIZE = Long.BYTES;
-    private static final int COMMIT_FLAG_SIZE  = Byte.BYTES;
+    //
+    //  [ length (8 bytes) ][ payload (maxPayloadSize bytes) ][ commit (1 byte) ]
+    //  ^                   ^                                  ^
+    //  slotOffset          slotOffset + 8                     slotOffset + 8 + maxPayloadSize
+    //
+    static final int LENGTH_FIELD_SIZE = Long.BYTES;   // 8
+    static final int COMMIT_FLAG_SIZE  = Byte.BYTES;   // 1
 
     // ── VarHandle for Memory Barriers ───────────────────────────────────
     /**
@@ -100,15 +98,23 @@ public class SPSCRingBuffer implements AutoCloseable {
     // ── Instance Fields ─────────────────────────────────────────────────
     private final MappedByteBuffer buffer;
     private final FileChannel channel;
-    private final int capacity;       // number of message slots
-    private final int slotSize;       // bytes per slot (length + payload + commit)
-    private final int ringSize;       // total bytes in the data region
+    private final int capacity;         // number of message slots
+    private final int maxPayloadSize;   // max payload bytes per slot
+    private final int slotSize;         // bytes per slot (length + payload + commit)
+    private final int ringSize;         // total bytes in the data region
+
+    // ── Cached Sequences ────────────────────────────────────────────────
+    // The producer caches the consumer sequence locally to avoid reading
+    // across cache lines on every write. Only re-reads when the buffer
+    // appears full. Same idea as the Disruptor's "cachedGatingSequence."
+    private long cachedConsumerSeq = 0;
+    private long cachedProducerSeq = 0;
 
     /**
      * Creates a new SPSC Ring Buffer backed by a memory-mapped file.
      *
-     * @param filePath     path to the shared file (created if absent)
-     * @param capacity     number of message slots (must be power of 2)
+     * @param filePath       path to the shared file (created if absent)
+     * @param capacity       number of message slots (must be power of 2)
      * @param maxPayloadSize maximum payload size per message in bytes
      * @throws IOException if file mapping fails
      */
@@ -118,8 +124,12 @@ public class SPSCRingBuffer implements AutoCloseable {
                     "Capacity must be a power of 2, got: " + capacity
                             + ". Use " + Integer.highestOneBit(capacity) * 2 + " instead.");
         }
+        if (maxPayloadSize <= 0) {
+            throw new IllegalArgumentException("maxPayloadSize must be positive, got: " + maxPayloadSize);
+        }
 
         this.capacity = capacity;
+        this.maxPayloadSize = maxPayloadSize;
         this.slotSize = LENGTH_FIELD_SIZE + maxPayloadSize + COMMIT_FLAG_SIZE;
         this.ringSize = capacity * slotSize;
 
@@ -142,8 +152,8 @@ public class SPSCRingBuffer implements AutoCloseable {
      * Write a message into the ring buffer.
      *
      * Memory ordering contract:
-     *   1. Write payload bytes                   (plain stores)
-     *   2. Write payload length                  (plain store)
+     *   1. Write payload length                  (plain store)
+     *   2. Write payload bytes                   (plain stores)
      *   3. Write commit flag = 1                 (RELEASE store)
      *   4. Advance producer sequence             (RELEASE store)
      *
@@ -152,14 +162,23 @@ public class SPSCRingBuffer implements AutoCloseable {
      *
      * @param payload the message bytes to write
      * @return true if written, false if the buffer is full
+     * @throws IllegalArgumentException if payload exceeds maxPayloadSize
      */
     public boolean write(byte[] payload) {
-        long producerSeq = getProducerSequence();
-        long consumerSeq = getConsumerSequenceAcquire();
+        if (payload.length > maxPayloadSize) {
+            throw new IllegalArgumentException(
+                    "Payload size " + payload.length + " exceeds max " + maxPayloadSize);
+        }
 
-        // Check if buffer is full (producer has lapped the consumer)
-        if (producerSeq - consumerSeq >= capacity) {
-            return false; // Buffer full — don't block, let caller decide
+        long producerSeq = getProducerSequence();
+
+        // Fast path: check cached consumer sequence first (avoids cross-cache-line read)
+        if (producerSeq - cachedConsumerSeq >= capacity) {
+            // Cache miss — actually read the consumer sequence
+            cachedConsumerSeq = getConsumerSequenceAcquire();
+            if (producerSeq - cachedConsumerSeq >= capacity) {
+                return false; // Buffer genuinely full
+            }
         }
 
         int slotIndex = (int) (producerSeq & (capacity - 1)); // mod via bitmask
@@ -169,19 +188,63 @@ public class SPSCRingBuffer implements AutoCloseable {
         buffer.putLong(slotOffset, payload.length);
 
         // Step 2: Write payload data
+        int payloadOffset = slotOffset + LENGTH_FIELD_SIZE;
         for (int i = 0; i < payload.length; i++) {
-            buffer.put(slotOffset + LENGTH_FIELD_SIZE + i, payload[i]);
+            buffer.put(payloadOffset + i, payload[i]);
         }
 
         // Step 3: Write commit flag with RELEASE semantics
-        // This is the "memory barrier" — it guarantees all previous writes
-        // (length + payload) are flushed to memory BEFORE the commit flag.
-        int commitOffset = slotOffset + LENGTH_FIELD_SIZE + (slotSize - LENGTH_FIELD_SIZE - COMMIT_FLAG_SIZE);
+        // This is the critical memory barrier. It guarantees all stores above
+        // (length + payload bytes) are visible BEFORE the consumer sees commit=1.
+        int commitOffset = slotOffset + LENGTH_FIELD_SIZE + maxPayloadSize;
         setByteRelease(buffer, commitOffset, (byte) 1);
 
         // Step 4: Advance producer sequence with RELEASE semantics
         setProducerSequenceRelease(producerSeq + 1);
 
+        return true;
+    }
+
+    /**
+     * Write from a ByteBuffer — avoids the byte[] intermediate for zero-copy paths.
+     * The source buffer's position is advanced by the number of bytes written.
+     *
+     * @param src    source buffer to read from (between position and limit)
+     * @return true if written, false if the buffer is full
+     */
+    public boolean write(ByteBuffer src) {
+        int len = src.remaining();
+        if (len > maxPayloadSize) {
+            throw new IllegalArgumentException(
+                    "Payload size " + len + " exceeds max " + maxPayloadSize);
+        }
+
+        long producerSeq = getProducerSequence();
+
+        if (producerSeq - cachedConsumerSeq >= capacity) {
+            cachedConsumerSeq = getConsumerSequenceAcquire();
+            if (producerSeq - cachedConsumerSeq >= capacity) {
+                return false;
+            }
+        }
+
+        int slotIndex = (int) (producerSeq & (capacity - 1));
+        int slotOffset = DATA_OFFSET + (slotIndex * slotSize);
+
+        // Write length
+        buffer.putLong(slotOffset, len);
+
+        // Write payload from source ByteBuffer
+        int payloadOffset = slotOffset + LENGTH_FIELD_SIZE;
+        for (int i = 0; i < len; i++) {
+            buffer.put(payloadOffset + i, src.get());
+        }
+
+        // Commit with release barrier
+        int commitOffset = slotOffset + LENGTH_FIELD_SIZE + maxPayloadSize;
+        setByteRelease(buffer, commitOffset, (byte) 1);
+
+        setProducerSequenceRelease(producerSeq + 1);
         return true;
     }
 
@@ -208,31 +271,33 @@ public class SPSCRingBuffer implements AutoCloseable {
      */
     public boolean read(MessageView view) {
         long consumerSeq = getConsumerSequence();
-        long producerSeq = getProducerSequenceAcquire();
 
-        // Nothing to read
-        if (consumerSeq >= producerSeq) {
-            return false;
+        // Fast path: check cached producer sequence
+        if (consumerSeq >= cachedProducerSeq) {
+            cachedProducerSeq = getProducerSequenceAcquire();
+            if (consumerSeq >= cachedProducerSeq) {
+                return false; // Nothing to read
+            }
         }
 
         int slotIndex = (int) (consumerSeq & (capacity - 1));
         int slotOffset = DATA_OFFSET + (slotIndex * slotSize);
 
-        // Step 3: Check commit flag with ACQUIRE semantics
-        int commitOffset = slotOffset + LENGTH_FIELD_SIZE + (slotSize - LENGTH_FIELD_SIZE - COMMIT_FLAG_SIZE);
+        // Check commit flag with ACQUIRE semantics
+        int commitOffset = slotOffset + LENGTH_FIELD_SIZE + maxPayloadSize;
         byte committed = getByteAcquire(buffer, commitOffset);
 
         if (committed != 1) {
-            return false; // Producer hasn't finished writing yet
+            return false; // Producer hasn't finished writing this slot yet
         }
 
-        // Step 4: Read message into the flyweight view (ZERO allocation)
-        view.wrap(buffer, slotOffset, slotSize);
+        // Read message into the flyweight view (ZERO allocation)
+        view.wrap(buffer, slotOffset, slotSize, maxPayloadSize);
 
-        // Step 5: Clear commit flag for reuse
+        // Clear commit flag for reuse
         buffer.put(commitOffset, (byte) 0);
 
-        // Step 6: Advance consumer sequence
+        // Advance consumer sequence with RELEASE semantics
         setConsumerSequenceRelease(consumerSeq + 1);
 
         return true;
@@ -290,13 +355,15 @@ public class SPSCRingBuffer implements AutoCloseable {
     }
 
     // ══════════════════════════════════════════════════════════════════════
-    //  UTILITY
+    //  UTILITY / INTROSPECTION
     // ══════════════════════════════════════════════════════════════════════
 
     /** Reset all sequences and clear the buffer. Useful for benchmarking. */
     public void reset() {
         BYTE_BUFFER_LONG_VIEW.setVolatile(buffer, PRODUCER_SEQUENCE_OFFSET, 0L);
         BYTE_BUFFER_LONG_VIEW.setVolatile(buffer, CONSUMER_SEQUENCE_OFFSET, 0L);
+        cachedConsumerSeq = 0;
+        cachedProducerSeq = 0;
         for (int i = DATA_OFFSET; i < DATA_OFFSET + ringSize; i++) {
             buffer.put(i, (byte) 0);
         }
@@ -306,10 +373,39 @@ public class SPSCRingBuffer implements AutoCloseable {
         return capacity;
     }
 
+    public int getMaxPayloadSize() {
+        return maxPayloadSize;
+    }
+
+    public int getSlotSize() {
+        return slotSize;
+    }
+
+    /** Number of messages currently in the buffer (approximate — racy read). */
+    public long size() {
+        long prod = (long) BYTE_BUFFER_LONG_VIEW.getAcquire(buffer, PRODUCER_SEQUENCE_OFFSET);
+        long cons = (long) BYTE_BUFFER_LONG_VIEW.getAcquire(buffer, CONSUMER_SEQUENCE_OFFSET);
+        return prod - cons;
+    }
+
+    /** How many slots remain before the buffer is full (approximate). */
+    public long remainingCapacity() {
+        return capacity - size();
+    }
+
     @Override
     public void close() throws IOException {
         // Force flush to disk (optional — OS handles this on crash too)
         buffer.force();
         channel.close();
+    }
+
+    @Override
+    public String toString() {
+        return "SPSCRingBuffer{capacity=" + capacity
+                + ", maxPayload=" + maxPayloadSize
+                + ", slotSize=" + slotSize
+                + ", size≈" + size()
+                + "}";
     }
 }
