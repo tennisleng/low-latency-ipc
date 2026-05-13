@@ -7,148 +7,106 @@ import java.nio.ByteBuffer;
 import java.nio.file.Path;
 
 /**
- * End-to-end latency measurement demo.
+ * Automated latency test: spins up producer + consumer threads, measures
+ * real end-to-end latency using timestamps baked into the messages, then
+ * runs the same thing with LinkedBlockingQueue to show the difference.
  *
- * Runs producer and consumer on separate threads (same JVM for simplicity)
- * and measures true IPC latency using embedded timestamps.
- *
- * This is the "proof" that the system works: you should see flat, consistent
- * latency with no GC spikes.
- *
- * Run: ./gradlew runLatencyDemo
+ *   ./gradlew runLatencyDemo
  */
 public class LatencyDemo {
 
-    private static final Path SHARED_FILE = Path.of("/tmp/ipc-latency-demo.dat");
+    private static final Path FILE = Path.of("/tmp/ipc-latency-demo.dat");
     private static final int CAPACITY = 4096;
     private static final int MAX_PAYLOAD = 64;
-    private static final int MESSAGE_COUNT = 500_000;
-    private static final int WARMUP_COUNT = 50_000;
+    private static final int MSG_COUNT = 500_000;
+    private static final int WARMUP = 50_000;
 
     public static void main(String[] args) throws Exception {
-        System.out.println("┌──────────────────────────────────────────┐");
-        System.out.println("│     End-to-End Latency Measurement      │");
-        System.out.println("├──────────────────────────────────────────┤");
-        System.out.printf("│  Messages:  %,d (+ %,d warmup)%n", MESSAGE_COUNT, WARMUP_COUNT);
-        System.out.printf("│  Capacity:  %d slots%n", CAPACITY);
-        System.out.println("│  Mode:      timestamp-in-payload        │");
-        System.out.println("└──────────────────────────────────────────┘");
-        System.out.println();
+        System.out.printf("[LatencyDemo] %,d messages (%,d warmup), capacity=%d%n%n",
+                MSG_COUNT, WARMUP, CAPACITY);
 
-        SPSCRingBuffer ring = new SPSCRingBuffer(SHARED_FILE, CAPACITY, MAX_PAYLOAD);
+        SPSCRingBuffer ring = new SPSCRingBuffer(FILE, CAPACITY, MAX_PAYLOAD);
         ring.reset();
 
-        LatencyHistogram histogram = new LatencyHistogram();
-        int totalMessages = WARMUP_COUNT + MESSAGE_COUNT;
+        LatencyHistogram hist = new LatencyHistogram();
+        int total = WARMUP + MSG_COUNT;
 
-        // ── Consumer thread ─────────────────────────────────────────────
         Thread consumer = new Thread(() -> {
             MessageView view = new MessageView();
-            int received = 0;
-
-            while (received < totalMessages) {
+            int rx = 0;
+            while (rx < total) {
                 if (ring.read(view)) {
-                    long latency = TimestampedMessage.decodeLatency(view);
-
-                    // Only record after warmup
-                    if (received >= WARMUP_COUNT) {
-                        histogram.record(latency);
-                    }
-
-                    received++;
+                    long lat = TimestampedMessage.decodeLatency(view);
+                    if (rx >= WARMUP) hist.record(lat);
+                    rx++;
                 } else {
                     Thread.onSpinWait();
                 }
             }
         }, "consumer");
 
-        // ── Producer thread ─────────────────────────────────────────────
         Thread producer = new Thread(() -> {
             ByteBuffer scratch = ByteBuffer.allocate(MAX_PAYLOAD);
-
-            for (int i = 0; i < totalMessages; i++) {
+            for (int i = 0; i < total; i++) {
                 TimestampedMessage.encodeTimestampOnly(scratch);
-
-                while (!ring.write(scratch)) {
-                    Thread.onSpinWait();
-                }
+                while (!ring.write(scratch)) Thread.onSpinWait();
             }
         }, "producer");
 
-        // ── Run ─────────────────────────────────────────────────────────
-        long startTime = System.nanoTime();
-
+        long t0 = System.nanoTime();
         consumer.start();
         producer.start();
-
         producer.join();
         consumer.join();
+        long elapsed = System.nanoTime() - t0;
 
-        long elapsed = System.nanoTime() - startTime;
-
-        // ── Results ─────────────────────────────────────────────────────
-        System.out.println("=== Results ===");
-        System.out.println();
-        System.out.println(histogram.prettyPrint());
-        System.out.printf("Total time: %.2f seconds%n", elapsed / 1_000_000_000.0);
-        System.out.printf("Throughput: %,.0f msgs/sec%n",
-                (double) MESSAGE_COUNT / (elapsed / 1_000_000_000.0));
-        System.out.println();
+        System.out.println("=== SPSC Ring Buffer ===");
+        System.out.println(hist.prettyPrint());
+        System.out.printf("  time: %.2fs   throughput: %,.0f msg/s%n%n",
+                elapsed / 1e9, MSG_COUNT / (elapsed / 1e9));
 
         ring.close();
 
-        // ── Now run the same test with LinkedBlockingQueue for comparison ─
-        System.out.println("=== Baseline: LinkedBlockingQueue ===");
-        System.out.println();
-        runLBQBaseline();
+        // baseline comparison
+        System.out.println("=== LinkedBlockingQueue (baseline) ===");
+        runLBQ();
     }
 
-    private static void runLBQBaseline() throws InterruptedException {
-        java.util.concurrent.LinkedBlockingQueue<long[]> lbq =
-                new java.util.concurrent.LinkedBlockingQueue<>(4096);
-
-        LatencyHistogram lbqHistogram = new LatencyHistogram();
-        int total = WARMUP_COUNT + MESSAGE_COUNT;
+    private static void runLBQ() throws InterruptedException {
+        var lbq = new java.util.concurrent.LinkedBlockingQueue<long[]>(4096);
+        LatencyHistogram hist = new LatencyHistogram();
+        int total = WARMUP + MSG_COUNT;
 
         Thread consumer = new Thread(() -> {
-            int received = 0;
+            int rx = 0;
             try {
-                while (received < total) {
+                while (rx < total) {
                     long[] msg = lbq.take();
-                    long latency = System.nanoTime() - msg[0];
-                    if (received >= WARMUP_COUNT) {
-                        lbqHistogram.record(latency);
-                    }
-                    received++;
+                    long lat = System.nanoTime() - msg[0];
+                    if (rx >= WARMUP) hist.record(lat);
+                    rx++;
                 }
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
+            } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
         }, "lbq-consumer");
 
         Thread producer = new Thread(() -> {
             try {
                 for (int i = 0; i < total; i++) {
-                    lbq.put(new long[]{System.nanoTime()}); // allocates every time!
+                    lbq.put(new long[]{System.nanoTime()});
                 }
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
+            } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
         }, "lbq-producer");
 
-        long startTime = System.nanoTime();
+        long t0 = System.nanoTime();
         consumer.start();
         producer.start();
         producer.join();
         consumer.join();
-        long elapsed = System.nanoTime() - startTime;
+        long elapsed = System.nanoTime() - t0;
 
-        System.out.println(lbqHistogram.prettyPrint());
-        System.out.printf("Total time: %.2f seconds%n", elapsed / 1_000_000_000.0);
-        System.out.printf("Throughput: %,.0f msgs/sec%n",
-                (double) MESSAGE_COUNT / (elapsed / 1_000_000_000.0));
-        System.out.println();
-        System.out.println("Compare the p99/p999 between the two — the LBQ will show");
-        System.out.println("GC-induced spikes that the SPSC ring buffer avoids.");
+        System.out.println(hist.prettyPrint());
+        System.out.printf("  time: %.2fs   throughput: %,.0f msg/s%n%n",
+                elapsed / 1e9, MSG_COUNT / (elapsed / 1e9));
+        System.out.println("look at the p99/p999 — LBQ will have GC spikes that SPSC doesn't.");
     }
 }

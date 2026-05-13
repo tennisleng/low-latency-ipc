@@ -2,43 +2,21 @@ package com.tennisleng.ipc;
 
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.charset.StandardCharsets;
 
 /**
- * Encodes a timestamp INTO the message payload so the consumer can compute
- * true end-to-end latency (producer-to-consumer), not just "how long did
- * the read() call take."
+ * Embeds a nanoTime timestamp at the start of each message so the consumer
+ * can measure real end-to-end latency (not just how long read() took).
  *
- * Message format:
- *   [8 bytes: nanoTime timestamp] [remaining bytes: user payload]
- *
- * The producer calls:
- *   TimestampedMessage.encode(userPayload, scratchBuffer);
- *   ring.write(scratchBuffer);
- *
- * The consumer calls:
- *   ring.read(view);
- *   long latencyNanos = TimestampedMessage.decodeLatency(view);
- *
- * This gives you the REAL IPC latency: time from producer.write() to
- * consumer.read(), including any spin-wait time, cache coherence delay,
- * and OS scheduling jitter.
- *
- * Zero-allocation: uses a pre-allocated scratch ByteBuffer.
+ * Format: [8B timestamp][user payload bytes...]
  */
 public final class TimestampedMessage {
 
-    /** Timestamp is always the first 8 bytes of the payload. */
     public static final int TIMESTAMP_SIZE = Long.BYTES;
 
-    private TimestampedMessage() {} // utility class — no instances
+    private TimestampedMessage() {}
 
-    /**
-     * Encode a user payload with a leading timestamp.
-     *
-     * @param userPayload  the actual message data
-     * @param dest         pre-allocated scratch buffer (must fit TIMESTAMP_SIZE + userPayload.length)
-     * @return the dest buffer, flipped and ready for ring.write(ByteBuffer)
-     */
+    /** Writes timestamp + payload into dest. Flips it so it's ready for ring.write(). */
     public static ByteBuffer encode(byte[] userPayload, ByteBuffer dest) {
         dest.clear();
         dest.order(ByteOrder.nativeOrder());
@@ -48,10 +26,7 @@ public final class TimestampedMessage {
         return dest;
     }
 
-    /**
-     * Encode with just a timestamp (no user payload).
-     * Useful for pure latency measurement.
-     */
+    /** Timestamp only, no user payload. For pure latency benchmarking. */
     public static ByteBuffer encodeTimestampOnly(ByteBuffer dest) {
         dest.clear();
         dest.order(ByteOrder.nativeOrder());
@@ -60,40 +35,23 @@ public final class TimestampedMessage {
         return dest;
     }
 
-    /**
-     * Extract the send timestamp from a received message.
-     *
-     * @param view the message view from ring.read()
-     * @return the nanoTime that was recorded when the producer sent this message
-     */
     public static long decodeSendTimestamp(MessageView view) {
         return view.getLong(0);
     }
 
-    /**
-     * Compute the one-way latency for a received message.
-     *
-     * @param view the message view from ring.read()
-     * @return latency in nanoseconds (now - sendTimestamp)
-     */
+    /** Returns nanos since the message was sent. */
     public static long decodeLatency(MessageView view) {
-        long sendTime = view.getLong(0);
-        return System.nanoTime() - sendTime;
+        return System.nanoTime() - view.getLong(0);
     }
 
-    /**
-     * Get the user payload portion (everything after the timestamp).
-     * WARNING: allocates — use only for debugging.
-     */
+    /** Extracts just the user part (after the timestamp). Allocates — debug only. */
     public static String decodeUserPayloadAsString(MessageView view) {
-        int totalLen = view.getPayloadLength();
-        int userLen = totalLen - TIMESTAMP_SIZE;
+        int userLen = view.getPayloadLength() - TIMESTAMP_SIZE;
         if (userLen <= 0) return "";
-
         byte[] data = new byte[userLen];
         for (int i = 0; i < userLen; i++) {
             data[i] = view.getByte(TIMESTAMP_SIZE + i);
         }
-        return new String(data, java.nio.charset.StandardCharsets.UTF_8);
+        return new String(data, StandardCharsets.UTF_8);
     }
 }

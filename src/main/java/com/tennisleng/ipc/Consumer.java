@@ -4,16 +4,11 @@ import java.io.IOException;
 import java.nio.file.Path;
 
 /**
- * Consumer process — reads messages from the shared ring buffer.
+ * Reads messages from the ring buffer. Run the Producer in a separate terminal.
  *
- * Usage:
- *   ./gradlew runConsumer                    # default: YIELD wait
- *   ./gradlew runConsumer --args="--spin"    # busy-spin (lowest latency)
- *   ./gradlew runConsumer --args="--verbose" # print every message
- *
- * The key thing to look at: zero `new` keywords inside the hot loop.
- * The MessageView is allocated ONCE before the loop — that's the Flyweight pattern.
- * The LatencyHistogram records directly into pre-allocated arrays.
+ *   ./gradlew runConsumer
+ *   ./gradlew runConsumer --args="--verbose"   # print every message
+ *   ./gradlew runConsumer --args="--spin"      # busy-wait (lowest latency)
  */
 public class Consumer {
 
@@ -22,72 +17,53 @@ public class Consumer {
     private static final int MAX_PAYLOAD = 256;
 
     public static void main(String[] args) throws IOException {
-        // ── Parse CLI args ──────────────────────────────────────────────
         boolean verbose = false;
-        WaitStrategy waitStrategy = WaitStrategy.YIELD;
+        WaitStrategy ws = WaitStrategy.YIELD;
 
         for (String arg : args) {
             switch (arg) {
-                case "--verbose" -> verbose = true;
-                case "--spin" -> waitStrategy = WaitStrategy.SPIN;
-                case "--sleep" -> waitStrategy = WaitStrategy.SLEEP;
-                case "--progressive" -> waitStrategy = WaitStrategy.PROGRESSIVE;
+                case "--verbose"     -> verbose = true;
+                case "--spin"        -> ws = WaitStrategy.SPIN;
+                case "--sleep"       -> ws = WaitStrategy.SLEEP;
+                case "--progressive" -> ws = WaitStrategy.PROGRESSIVE;
             }
         }
 
-        System.out.println("┌──────────────────────────────────────────┐");
-        System.out.println("│       CONSUMER — Low Latency IPC        │");
-        System.out.println("├──────────────────────────────────────────┤");
-        System.out.printf("│  Wait: %s%n", waitStrategy);
-        System.out.println("│  Waiting for messages...                │");
-        System.out.println("└──────────────────────────────────────────┘");
-        System.out.println();
+        System.out.printf("[Consumer] waiting for messages (wait=%s)...%n", ws);
 
-        // ── Latency tracking ────────────────────────────────────────────
-        LatencyHistogram readLatency = new LatencyHistogram();
-        final WaitStrategy ws = waitStrategy;
+        LatencyHistogram hist = new LatencyHistogram();
+        final WaitStrategy wait = ws;
         final boolean verb = verbose;
 
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            System.out.println("\n[Consumer] Shutting down...");
-            System.out.println(readLatency.prettyPrint());
+            System.out.println("\n" + hist.prettyPrint());
         }));
 
         try (SPSCRingBuffer ring = new SPSCRingBuffer(SHARED_FILE, CAPACITY, MAX_PAYLOAD)) {
-            // ┌─────────────────────────────────────────────────────┐
-            // │  Allocate ONCE — reuse forever. This is the key.    │
-            // └─────────────────────────────────────────────────────┘
+            // allocated once — reused on every read. this is the whole point.
             MessageView view = new MessageView();
-            byte[] reusableBuffer = new byte[MAX_PAYLOAD];
 
-            long messageCount = 0;
-            long lastReportTime = System.nanoTime();
-            long reportInterval = 2_000_000_000L; // 2 seconds
+            long count = 0;
+            long lastReport = System.nanoTime();
 
-            // ─── THE HOT LOOP ─── (zero allocations inside!) ────────
             while (true) {
                 long t0 = System.nanoTime();
 
                 if (ring.read(view)) {
-                    readLatency.recordSince(t0);
-                    ws.reset();
+                    hist.recordSince(t0);
+                    wait.reset();
 
-                    if (verb) {
-                        // This allocates (String creation) — only use for debugging
-                        System.out.println("[Consumer] " + view.getPayloadAsString());
-                    }
+                    if (verb) System.out.println("  " + view.getPayloadAsString());
+                    count++;
 
-                    messageCount++;
-
-                    // Periodic reporting (uses nanoTime comparison — no allocation)
                     long now = System.nanoTime();
-                    if (now - lastReportTime > reportInterval) {
-                        System.out.printf("[Consumer] %,d msgs received  buffer≈%d/%d%n",
-                                messageCount, ring.size(), ring.getCapacity());
-                        lastReportTime = now;
+                    if (now - lastReport > 2_000_000_000L) {
+                        System.out.printf("[Consumer] %,d received  buffer~%d/%d%n",
+                                count, ring.size(), ring.getCapacity());
+                        lastReport = now;
                     }
                 } else {
-                    ws.idle();
+                    wait.idle();
                 }
             }
         }
