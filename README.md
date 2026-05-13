@@ -62,24 +62,6 @@ You'll need Java 21+ and the Gradle wrapper handles the rest.
 ./gradlew test
 ```
 
-## how I'm learning this
-
-I'm following a ~4 week plan. Each week builds on the last.
-
-**Week 1** — just reading. Cache lines, false sharing, the Java Memory Model. Understanding *why* you pad the producer and consumer sequence counters to sit on different 64-byte cache lines.
-
-**Week 2** — the `HelloMmap` demo. Getting comfortable with `FileChannel.map()` and `MappedByteBuffer`. It's surprisingly straightforward if you've used `mmap` in C.
-
-**Week 3** — building the actual SPSC queue. The ring buffer indexing is easy (`seq & (capacity - 1)` instead of modulo). The hard part is getting the `VarHandle` acquire/release semantics right so the consumer never sees a torn write.
-
-**Week 4** — the flyweight pattern + benchmarking with JMH. The goal is to prove that latency stays flat while a standard `LinkedBlockingQueue` gets destroyed by GC pauses.
-
-## notes to self
-
-- Capacity has to be a power of 2 (bitmask trick for wrapping)
-- The commit flag uses release semantics on write, acquire on read — this is what guarantees the payload is fully written before the consumer touches it
-- `Thread.onSpinWait()` is the Java version of `_mm_pause()` — tells the CPU you're in a spin loop so it can save power
-- The 56 bytes of padding between the producer and consumer sequence pointers isn't wasted space — it prevents false sharing. Without it, the two CPU cores fight over the same cache line and throughput drops ~10x.
 
 ## license
 
