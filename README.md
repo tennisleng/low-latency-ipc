@@ -1,76 +1,86 @@
-# Low-Latency IPC — SPSC Ring Buffer over Memory-Mapped Files
+# low-latency-ipc
 
-A zero-garbage, sub-microsecond inter-process communication system in Java, built from scratch using `VarHandle` memory barriers and `MappedByteBuffer` — no sockets, no serialization, no GC pauses.
+I'm building a lock-free IPC system in Java from scratch. Two JVM processes talking through shared memory — no sockets, no serialization, no garbage collection in the hot path.
 
-Inspired by the **LMAX Disruptor** architecture used in real trading systems.
+The idea comes from the LMAX Disruptor, which is what a lot of trading firms use under the hood. I wanted to actually understand how it works instead of just importing a library.
 
-## Architecture
+## what this is
 
-```
-┌──────────────┐     Memory-Mapped File      ┌──────────────┐
-│   Producer   │ ──── /tmp/ipc-ring.dat ───── │   Consumer   │
-│   (JVM 1)    │     [shared memory region]   │   (JVM 2)    │
-└──────────────┘                              └──────────────┘
-         │                                            │
-         ▼                                            ▼
-   VarHandle.setRelease()                  VarHandle.getAcquire()
-   (RELEASE barrier)                       (ACQUIRE barrier)
-```
+A single-producer, single-consumer (SPSC) ring buffer backed by a memory-mapped file. Process A writes messages into a file. Process B reads them out. Except it's not really "file I/O" — the OS maps the same physical memory page into both processes, so the data never actually gets copied anywhere. It's basically `mmap` but in Java.
 
-## Project Structure
+The tricky part isn't the ring buffer logic (that's just LeetCode 622). The tricky part is making sure the consumer doesn't read a half-written message. That's where `VarHandle` comes in — it lets you do acquire/release memory barriers like `std::memory_order_acquire` in C++, but without paying for a full `volatile` fence.
 
 ```
-src/
-├── main/java/com/tennisleng/ipc/
-│   ├── SPSCRingBuffer.java     ← Core ring buffer with VarHandle barriers
-│   ├── MessageView.java        ← Flyweight (zero-alloc message reader)
-│   ├── Producer.java           ← Producer process entry point
-│   ├── Consumer.java           ← Consumer process entry point
-│   └── demo/
-│       └── HelloMmap.java      ← Week 2: basic mmap hello world
-├── test/java/...
-│   └── SPSCRingBufferTest.java ← Unit tests
-└── jmh/java/...
-    └── SPSCBenchmark.java      ← JMH: SPSC vs LinkedBlockingQueue
+Producer (JVM 1)                          Consumer (JVM 2)
+      │                                        │
+      │    ┌────────────────────────────┐       │
+      ├───>│  memory-mapped file        │<──────┤
+      │    │  /tmp/ipc-ring-buffer.dat  │       │
+      │    └────────────────────────────┘       │
+      │                                        │
+ setRelease()                            getAcquire()
 ```
 
-## Quick Start
+## why not just use sockets / a blocking queue
+
+- **Sockets** go through the kernel. Every send/recv is a context switch + a memcpy. That's fine for most things, but it's not sub-microsecond.
+- **`LinkedBlockingQueue`** allocates a new node object for every message. Eventually the GC has to clean all of them up, and when it does, your latency spikes from ~200ns to 10ms+.
+
+This avoids both problems. The data lives off-heap in a memory-mapped region, and the consumer reuses a single `MessageView` object (flyweight pattern) so there's literally zero allocation in the hot loop.
+
+## project layout
+
+```
+src/main/java/com/tennisleng/ipc/
+├── SPSCRingBuffer.java    -- the actual ring buffer. heavily commented.
+├── MessageView.java       -- flyweight view over a message slot (no copying)
+├── Producer.java          -- writer process
+├── Consumer.java          -- reader process
+└── demo/
+    └── HelloMmap.java     -- bare-bones mmap example to start with
+
+src/test/java/             -- junit tests
+src/jmh/java/              -- benchmark: SPSC vs LinkedBlockingQueue
+```
+
+## running it
+
+You'll need Java 21+ and the Gradle wrapper handles the rest.
 
 ```bash
-# Week 2: Hello World with memory-mapped files
+# start with this — just writes a long to a file and reads it back via mmap
 ./gradlew runHelloMmap
 
-# Week 3-4: Full IPC demo (run in separate terminals)
+# then try the full thing (two separate terminals)
 ./gradlew runProducer
 ./gradlew runConsumer
 
-# Week 4: Run benchmarks
+# benchmarks
 ./gradlew jmh
 
-# Run tests
+# tests
 ./gradlew test
 ```
 
-## Learning Timeline
+## how I'm learning this
 
-| Week | Focus | Key File |
-|------|-------|----------|
-| 1 | Cache lines, false sharing, JMM | Read the comments in `SPSCRingBuffer.java` |
-| 2 | `FileChannel.map()`, `MappedByteBuffer` | `HelloMmap.java` |
-| 3 | SPSC ring buffer + `VarHandle` barriers | `SPSCRingBuffer.java` |
-| 4 | Flyweight pattern + JMH benchmarks | `MessageView.java` + `SPSCBenchmark.java` |
+I'm following a ~4 week plan. Each week builds on the last.
 
-## Key Concepts
+**Week 1** — just reading. Cache lines, false sharing, the Java Memory Model. Understanding *why* you pad the producer and consumer sequence counters to sit on different 64-byte cache lines.
 
-### Why Not Sockets?
-Sockets involve kernel context switches and data copying. Memory-mapped files let two processes share the same physical memory page — zero copies, zero syscalls on the hot path.
+**Week 2** — the `HelloMmap` demo. Getting comfortable with `FileChannel.map()` and `MappedByteBuffer`. It's surprisingly straightforward if you've used `mmap` in C.
 
-### Why Not `volatile`?
-`volatile` is a full memory fence (`std::memory_order_seq_cst`). For SPSC, we only need acquire/release semantics — half the cost. `VarHandle` gives us that control.
+**Week 3** — building the actual SPSC queue. The ring buffer indexing is easy (`seq & (capacity - 1)` instead of modulo). The hard part is getting the `VarHandle` acquire/release semantics right so the consumer never sees a torn write.
 
-### What's the Flyweight Pattern?
-Instead of `new Message()` on every read (which creates garbage for the GC), we reuse a single `MessageView` object that just points to different offsets in the buffer. Zero allocations = zero GC pauses.
+**Week 4** — the flyweight pattern + benchmarking with JMH. The goal is to prove that latency stays flat while a standard `LinkedBlockingQueue` gets destroyed by GC pauses.
 
-## License
+## notes to self
+
+- Capacity has to be a power of 2 (bitmask trick for wrapping)
+- The commit flag uses release semantics on write, acquire on read — this is what guarantees the payload is fully written before the consumer touches it
+- `Thread.onSpinWait()` is the Java version of `_mm_pause()` — tells the CPU you're in a spin loop so it can save power
+- The 56 bytes of padding between the producer and consumer sequence pointers isn't wasted space — it prevents false sharing. Without it, the two CPU cores fight over the same cache line and throughput drops ~10x.
+
+## license
 
 MIT
