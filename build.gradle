@@ -75,6 +75,15 @@ tasks.register('runReader', JavaExec) {
     jvmArgs = ['--add-opens', 'java.base/sun.nio.ch=ALL-UNNAMED']
 }
 
+// End-to-end latency demo (compares SPSC vs LBQ)
+tasks.register('runLatencyDemo', JavaExec) {
+    group = 'application'
+    description = 'Run the latency measurement demo with histogram output'
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'com.tennisleng.ipc.demo.LatencyDemo'
+    jvmArgs = ['--add-opens', 'java.base/sun.nio.ch=ALL-UNNAMED']
+}
+
 application {
     mainClass = 'com.tennisleng.ipc.Producer'
 }
